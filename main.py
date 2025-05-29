@@ -195,11 +195,28 @@ async def health():
         "key_usage": sum(key_usage.values())
     }
 
-# CORS
+# CORS middleware - daha güçlü versiyon
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Ek CORS handler
 @app.middleware("http")
 async def cors_handler(request, call_next):
     response = await call_next(request)
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Max-Age"] = "86400"
     return response
+
+@app.options("/{path:path}")
+async def options_handler():
+    """Handle CORS preflight requests"""
+    return {"message": "OK"}
