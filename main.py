@@ -99,3 +99,7 @@ async def chat(request: Request):
         return JSONResponse({
             "error": {"message": str(e), "type": "internal_error"}
         }, status_code=500)
+
+# Vercel handler
+from mangum import Mangum
+handler = Mangum(app)
