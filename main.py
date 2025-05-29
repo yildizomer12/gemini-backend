@@ -5,15 +5,25 @@ import json
 import asyncio
 import base64
 from typing import List, Dict, Any, Union, Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
 
 # FastAPI app
-app = FastAPI(title="Gemini Backend for Vercel")
+app = FastAPI(title="Gemini Backend")
 
-# API Keys - production'da environment variable kullanın
+# CORS - En liberal ayarlar
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# API Keys
 API_KEYS = [
     "AIzaSyCT1PXjhup0VHx3Fz4AioHbVUHED0fVBP4",
     "AIzaSyArNqpA1EeeXBx-S3EVnP0tzao6r4BQnO0",
@@ -22,11 +32,9 @@ API_KEYS = [
     "AIzaSyBzqJebfbVPcBXQy7r4Y5sVgC499uV85i0"
 ]
 
-# Simple state management (in-memory)
 current_key_index = 0
-key_usage = {key: 0 for key in API_KEYS}
 
-# Pydantic Models
+# Models
 class ImageUrl(BaseModel):
     url: str
 
@@ -47,15 +55,14 @@ class ChatRequest(BaseModel):
     stream: bool = False
 
 def get_next_key():
-    """Simple round-robin key selection"""
+    """Get next API key"""
     global current_key_index
     key = API_KEYS[current_key_index]
     current_key_index = (current_key_index + 1) % len(API_KEYS)
-    key_usage[key] = key_usage.get(key, 0) + 1
     return key
 
-def process_content(content):
-    """Convert OpenAI format to Gemini format"""
+def convert_content(content):
+    """Convert OpenAI content to Gemini"""
     if isinstance(content, str):
         return [{"text": content}]
     
@@ -65,7 +72,6 @@ def process_content(content):
             parts.append({"text": item.text})
         elif item.type == "image_url" and item.image_url:
             try:
-                # Handle base64 images
                 if item.image_url.url.startswith("data:"):
                     header, base64_data = item.image_url.url.split(",", 1)
                     mime_type = header.split(";")[0].split(":")[1]
@@ -76,32 +82,32 @@ def process_content(content):
                         }
                     })
             except:
-                parts.append({"text": "[Image processing error]"})
+                parts.append({"text": "[Image error]"})
     
     return parts or [{"text": ""}]
 
 def convert_messages(messages):
-    """Convert OpenAI messages to Gemini format"""
+    """Convert messages to Gemini format"""
     return [
         {
             "role": "user" if msg.role == "user" else "model",
-            "parts": process_content(msg.content)
+            "parts": convert_content(msg.content)
         }
         for msg in messages
     ]
 
 async def stream_response(text: str, model: str):
-    """Stream response in OpenAI format"""
+    """Stream in OpenAI format"""
     chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     
-    # Initial chunk
+    # Role chunk
     yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
     
     # Content chunks
     if text:
-        for i in range(0, len(text), 50):
-            chunk = text[i:i+50]
+        for i in range(0, len(text), 30):
+            chunk = text[i:i+30]
             yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {'content': chunk}, 'finish_reason': None}]})}\n\n"
             await asyncio.sleep(0.01)
     
@@ -109,24 +115,61 @@ async def stream_response(text: str, model: str):
     yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
     yield "data: [DONE]\n\n"
 
+@app.options("/{path:path}")
+async def options_handler():
+    """Handle preflight"""
+    return Response(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "*"
+        }
+    )
+
+@app.get("/health")
+async def health():
+    """Health check"""
+    return {
+        "status": "healthy",
+        "timestamp": int(time.time()),
+        "keys": len(API_KEYS),
+        "version": "1.0"
+    }
+
+@app.get("/v1/models")
+async def models():
+    """List models"""
+    return {
+        "object": "list",
+        "data": [
+            {"id": "gemini-pro", "object": "model", "created": int(time.time()), "owned_by": "google"},
+            {"id": "gemini-pro-vision", "object": "model", "created": int(time.time()), "owned_by": "google"}
+        ]
+    }
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatRequest):
+    """Chat completions endpoint"""
     try:
-        # Convert messages
-        gemini_messages = convert_messages(request.messages)
-        generation_config = {"temperature": request.temperature}
-        if request.max_tokens:
-            generation_config["max_output_tokens"] = request.max_tokens
-        
-        # Try with API key
+        # Get API key
         api_key = get_next_key()
         
+        # Convert messages
+        gemini_messages = convert_messages(request.messages)
+        
+        # Generation config
+        config = {"temperature": request.temperature}
+        if request.max_tokens:
+            config["max_output_tokens"] = request.max_tokens
+        
+        # Call Gemini API
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/{request.model}:generateContent",
                 json={
                     "contents": gemini_messages,
-                    "generationConfig": generation_config
+                    "generationConfig": config
                 },
                 headers={
                     "Content-Type": "application/json",
@@ -134,8 +177,13 @@ async def chat_completions(request: ChatRequest):
                 }
             )
             
-            if not response.is_success:
-                raise HTTPException(status_code=response.status_code, detail="Gemini API error")
+            if response.status_code != 200:
+                return {
+                    "error": {
+                        "message": f"Gemini API error: {response.status_code}",
+                        "type": "api_error"
+                    }
+                }
             
             result = response.json()
             
@@ -147,20 +195,20 @@ async def chat_completions(request: ChatRequest):
                     text = "".join(part.get("text", "") for part in candidate["content"]["parts"])
             
             if not text:
-                text = "No response generated"
+                text = "Üzgünüm, yanıt oluşturamadım."
             
-            # Handle streaming
+            # Return response
             if request.stream:
                 return StreamingResponse(
                     stream_response(text, request.model),
                     media_type="text/event-stream",
                     headers={
                         "Cache-Control": "no-cache",
-                        "Connection": "keep-alive"
+                        "Connection": "keep-alive",
+                        "Access-Control-Allow-Origin": "*"
                     }
                 )
             
-            # Regular response
             return {
                 "id": f"chatcmpl-{uuid.uuid4().hex}",
                 "object": "chat.completion",
@@ -175,48 +223,14 @@ async def chat_completions(request: ChatRequest):
             }
             
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "error": {
+                "message": str(e),
+                "type": "internal_error"
+            }
+        }
 
-@app.get("/v1/models")
-async def list_models():
-    return {
-        "object": "list",
-        "data": [
-            {"id": "gemini-pro", "object": "model", "created": int(time.time()), "owned_by": "google"},
-            {"id": "gemini-pro-vision", "object": "model", "created": int(time.time()), "owned_by": "google"}
-        ]
-    }
-
-@app.get("/health")
-async def health():
-    return {
-        "status": "healthy",
-        "timestamp": int(time.time()),
-        "key_usage": sum(key_usage.values())
-    }
-
-# CORS middleware - daha güçlü versiyon
-from fastapi.middleware.cors import CORSMiddleware
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Ek CORS handler
-@app.middleware("http")
-async def cors_handler(request, call_next):
-    response = await call_next(request)
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    response.headers["Access-Control-Max-Age"] = "86400"
-    return response
-
-@app.options("/{path:path}")
-async def options_handler():
-    """Handle CORS preflight requests"""
-    return {"message": "OK"}
+# Root endpoint
+@app.get("/")
+async def root():
+    return {"message": "Gemini API Backend", "status": "running"}
